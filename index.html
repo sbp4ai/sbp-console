@@ -1,0 +1,117 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="color-scheme" content="light">
+<title>SBP4AI 控制台</title>
+<link rel="stylesheet" href="console.css">
+</head>
+<body>
+
+<div class="app">
+  <aside class="sidebar">
+    <div class="sb-head">
+      <span class="brand">SBP4AI</span>
+      <button class="icon-btn" id="btnMgr" title="管理服务器">⚙</button>
+      <button class="icon-btn" id="btnRefresh" title="刷新会话">⟳</button>
+    </div>
+    <div class="sb-pick">
+      <select id="srvSel" title="切换远端服务器"></select>
+    </div>
+    <div class="sb-state">
+      <span class="dot off" id="dot"></span><span id="connState">未连接</span>
+    </div>
+    <div class="sb-body" id="list"></div>
+  </aside>
+
+  <main class="main">
+    <header class="topbar">
+      <button class="icon-btn sb-toggle" id="btnMenu" title="会话列表">☰</button>
+      <div class="ttl">
+        <div class="t1" id="sessTitle">未选择会话</div>
+        <div class="t2"><span id="sessSid"></span> <span class="chip" id="sessState"></span></div>
+      </div>
+      <span class="spacer"></span>
+      <button class="icon-btn" id="btnSnap" title="抓一屏">⟳</button>
+      <button class="icon-btn" id="btnEsc" title="发送 Esc">Esc</button>
+    </header>
+
+    <div class="empty" id="empty">
+      <div class="big">⌨</div>
+      <div>从左侧选一个会话</div>
+      <div class="hint">左上角下拉切换服务器</div>
+    </div>
+
+    <div class="stream" id="stream" hidden><div id="msgs"></div></div>
+
+    <div class="screen-wrap closed" id="screenWrap" hidden>
+      <div class="screen-head" id="screenHead">
+        <span class="caret">▾</span><span>实时屏幕</span>
+      </div>
+      <pre id="screen"></pre>
+    </div>
+
+    <!-- SBP-0.2：agent 摆在终端上的选项，这里变成可点的按钮 -->
+    <div class="prompts" id="prompts" hidden></div>
+
+    <div class="composer" id="composerWrap" hidden>
+      <div class="composer-row">
+        <textarea class="input" id="input" rows="1" placeholder="输入指令，Enter 发送，Shift+Enter 换行"></textarea>
+        <button class="send" id="send">发送</button>
+      </div>
+    </div>
+  </main>
+</div>
+
+<!-- 服务器管理 -->
+<div class="modal" id="mgr" hidden>
+  <div class="sheet">
+    <div class="sheet-head">
+      <b>远端服务器</b>
+      <span class="spacer"></span>
+      <button class="mini" id="mgrAdd">＋ 新增</button>
+      <button class="mini" id="mgrShare">复制配置链接</button>
+      <button class="mini" id="mgrClose">关闭</button>
+    </div>
+    <div class="sheet-body" id="mgrList"></div>
+
+    <div class="form" id="form" hidden>
+      <div class="frow"><label>名称</label><input id="fName" placeholder="例如 ECS / GPU 家机"></div>
+      <div class="frow"><label>地址</label><input id="fUrl" placeholder="wss://tools.example.com/sbp22" autocomplete="off"></div>
+      <div class="frow"><label></label><div class="hint" id="fUrlHint"></div></div>
+      <div class="frow"><label>鉴权</label>
+        <select id="fAuth">
+          <option value="hmac">HMAC（keyId + secret，推荐）</option>
+          <option value="token">Token（绑定码换来的）</option>
+          <option value="bearer">Bearer</option>
+          <option value="none">无（服务端没开鉴权时）</option>
+        </select>
+      </div>
+      <div class="frow" id="rowHmac"><label>keyId</label><input id="fKeyId" placeholder="ecs" autocomplete="off"></div>
+      <div class="frow" id="rowHmac2"><label>secret</label><input id="fSecret" type="password" autocomplete="new-password"></div>
+      <div class="frow" id="rowToken" hidden><label>token</label><input id="fToken" autocomplete="off"></div>
+      <div class="frow"><label></label>
+        <div class="fbtns">
+          <button class="mini" id="formTest">测试连接</button>
+          <button class="mini primary" id="formSave">保存</button>
+          <button class="mini" id="formCancel">取消</button>
+          <span class="fmsg" id="fMsg"></span>
+        </div>
+      </div>
+    </div>
+    <div class="sheet-foot hint">
+      地址可以写 <code>wss://host:8787</code> / <code>https://host/sbp22</code> / <code>host:8787/ws</code>，
+      缺的路径会自动补成 <code>/ws</code>。同一份 keyId + secret 在 sbp-server 的
+      <code>SBP_HMAC_KEYS</code> 里配置好即可。
+    </div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+<div class="scrim" id="scrim"></div>
+
+<script src="hmac.js"></script>
+<script src="console.js"></script>
+</body>
+</html>

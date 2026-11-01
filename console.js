@@ -1,0 +1,724 @@
+/* SBP Console —— 一个页面看 N 台服务器
+ *
+ * 每台机器上跑着 sbp-server（面板用 --bridge 把本机会话上报上去），这里只保存
+ * 「服务器地址 + 鉴权」的列表，左上角下拉切机器。所有数据都走 SBP 的 WebSocket：
+ *   hello → session.list → session.attach → session.history / output.delta / session.prompt
+ * 没有构建步骤，三个文件丢到任意静态目录（或本地 file://）就能跑。
+ */
+(function () {
+  'use strict'
+
+  var V = 'sbp/0.1'
+  var LS_SERVERS = 'sbp_console_servers'
+  var LS_CURRENT = 'sbp_console_current'
+  var HB_INTERVAL = 20          // 心跳间隔（秒）
+  var HB_TIMEOUT = 60           // 多久没任何回包就重连（秒）
+
+  // ------------------------------------------------------------------ 工具
+  function $(id) { return document.getElementById(id) }
+  function esc(s) {
+    return String(s == null ? '' : s).replace(/[&<>"]/g, function (c) {
+      return { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]
+    })
+  }
+  function ago(ts) {
+    if (!ts) return ''
+    var d = Math.max(0, Date.now() - ts) / 1000
+    if (typeof ts === 'string') return ''      // claude 的 ts 是 ISO 串，不硬转
+    if (d < 60) return '刚刚'
+    if (d < 3600) return Math.floor(d / 60) + ' 分钟前'
+    if (d < 86400) return Math.floor(d / 3600) + ' 小时前'
+    return Math.floor(d / 86400) + ' 天前'
+  }
+  function toast(msg, kind) {
+    var t = $('toast')
+    t.textContent = msg
+    t.className = 'toast show' + (kind ? ' ' + kind : '')
+    clearTimeout(toast._t)
+    toast._t = setTimeout(function () { t.className = 'toast' }, 2600)
+  }
+
+  // ------------------------------------------------------------------ 地址
+  /** scheme://host:port/path 一律补全成 ws(s) 地址，缺省路径 /ws */
+  function wsUrl(raw) {
+    var s = String(raw || '').trim().replace(/\/+$/, '')
+    if (!s) return ''
+    var scheme = 'wss'
+    if (/^ws:\/\//i.test(s)) { scheme = 'ws'; s = s.slice(5) }
+    else if (/^wss:\/\//i.test(s)) { s = s.slice(6) }
+    else if (/^http:\/\//i.test(s)) { scheme = 'ws'; s = s.slice(7) }
+    else if (/^https:\/\//i.test(s)) { s = s.slice(8) }
+    var slash = s.indexOf('/')
+    var hostport = slash > -1 ? s.slice(0, slash) : s
+    var path = slash > -1 ? s.slice(slash) : '/ws'
+    if (!path || path === '/') path = '/ws'
+    // 写成 wss://host/sbp-ecs 时，nginx 的 location 是 /sbp-ecs/，
+    // 少了那道斜杠会被 301 —— WebSocket 握手吃不下 301，所以这里补成 /sbp-ecs/ws
+    else if (!/\/(ws|sbp)$/.test(path) && !path.endsWith('/ws')) {
+      path = path.replace(/\/+$/, '') + '/ws'
+    }
+    return scheme + '://' + hostport + path
+  }
+  /** 同一个地址换成 http(s)，用来探 /api/health */
+  function httpBase(raw) {
+    var w = wsUrl(raw)
+    if (!w) return ''
+    var i = w.indexOf('://')
+    var scheme = w.slice(0, i) === 'ws' ? 'http' : 'https'
+    var rest = w.slice(i + 3)
+    var j = rest.indexOf('/')
+    return scheme + '://' + (j > -1 ? rest.slice(0, j) : rest)
+  }
+
+  // ------------------------------------------------------------------ 服务器列表
+  function loadServers() {
+    try {
+      var v = JSON.parse(localStorage.getItem(LS_SERVERS) || '[]')
+      return Array.isArray(v) ? v : []
+    } catch (e) { return [] }
+  }
+  function saveServers(list) { localStorage.setItem(LS_SERVERS, JSON.stringify(list)) }
+  function blankServer() {
+    return { id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
+             name: '', url: 'wss://', auth: 'hmac', keyId: '', secret: '', token: '' }
+  }
+  function titleOf(s) { return s.name || s.url || '未命名' }
+
+  // ------------------------------------------------------------------ 连接
+  function Conn(onFrame, onState) {
+    this.onFrame = onFrame
+    this.onState = onState
+    this.ws = null
+    this.cfg = null
+    this.n = 0
+    this.pending = {}
+    this.hbTimer = null
+    this.lastRecv = 0
+    this.retry = 0
+    this.reconnectTimer = null
+    this.closedByUser = false
+    this.state = 'closed'
+  }
+  Conn.prototype._setState = function (s, extra) {
+    this.state = s
+    if (this.onState) this.onState(s, extra)
+  }
+  Conn.prototype.connect = function (cfg) {
+    this.close()
+    this.cfg = cfg
+    this.closedByUser = false
+    var that = this
+    var url = wsUrl(cfg.url)
+    if (!url) { this._setState('error', '地址为空'); return }
+    this._setState('connecting', url)
+    var ws
+    try { ws = new WebSocket(url) } catch (e) { this._setState('error', String(e)); this._retry(); return }
+    this.ws = ws
+    ws.onopen = function () {
+      that.lastRecv = Date.now()
+      that.retry = 0
+      var hp = { role: 'client' }
+      if (cfg.auth === 'hmac') hp.auth = window.SbpHmac.auth(cfg)
+      else if ((cfg.auth === 'token' || cfg.auth === 'bearer') && cfg.token) hp.token = cfg.token
+      that.req('hello', hp, 8000).then(function (r) {
+        that._setState('open', r.payload || {})
+      }).catch(function (e) {
+        that._setState('error', (e && e.msg) || '握手失败')
+        ws.close()
+      })
+      that._hb()
+    }
+    ws.onmessage = function (ev) {
+      that.lastRecv = Date.now()
+      var f
+      try { f = JSON.parse(ev.data) } catch (e) { return }
+      if (f.type === 'res' && f.ref && that.pending[f.ref]) {
+        var p = that.pending[f.ref]
+        delete that.pending[f.ref]
+        if (f.ok) p.resolve(f); else p.reject(f.err || { code: 'E_FAIL', msg: '请求失败' })
+        return
+      }
+      if (f.type === 'evt') that.onFrame(f)
+    }
+    ws.onclose = function () {
+      that._stopHb()
+      if (that.closedByUser) { that._setState('closed'); return }
+      that._setState('closed')
+      that._retry()
+    }
+    ws.onerror = function () { /* close 里统一处理重连 */ }
+  }
+  Conn.prototype._retry = function () {
+    var that = this
+    if (this.closedByUser) return
+    this.retry = Math.min(this.retry + 1, 6)
+    var wait = Math.min(30, Math.pow(1.8, this.retry))
+    clearTimeout(this.reconnectTimer)
+    this.reconnectTimer = setTimeout(function () {
+      if (that.cfg && !that.closedByUser) that.connect(that.cfg)
+    }, wait * 1000)
+    this._setState('reconnect', Math.round(wait))
+  }
+  Conn.prototype._hb = function () {
+    var that = this
+    this._stopHb()
+    this.hbTimer = setInterval(function () {
+      if (!that.ws || that.ws.readyState !== 1) return
+      if (Date.now() - that.lastRecv > HB_TIMEOUT * 1000) { try { that.ws.close() } catch (e) {} return }
+      that.req('ping', { t: Date.now() }, 8000).catch(function () {})
+    }, HB_INTERVAL * 1000)
+  }
+  Conn.prototype._stopHb = function () { if (this.hbTimer) { clearInterval(this.hbTimer); this.hbTimer = null } }
+  Conn.prototype.req = function (name, payload, timeout) {
+    var that = this
+    if (!this.ws || this.ws.readyState !== 1) {
+      return Promise.reject({ code: 'E_NOT_OPEN', msg: '未连接' })
+    }
+    this.n += 1
+    var id = 'r' + this.n
+    var p = { resolve: null, reject: null }
+    var pr = new Promise(function (res, rej) { p.resolve = res; p.reject = rej })
+    this.pending[id] = p
+    try {
+      this.ws.send(JSON.stringify({ v: V, id: id, type: 'req', name: name, payload: payload || {} }))
+    } catch (e) {
+      delete this.pending[id]
+      return Promise.reject({ code: 'E_SEND', msg: '发送失败' })
+    }
+    setTimeout(function () {
+      if (that.pending[id]) {
+        delete that.pending[id]
+        p.reject({ code: 'E_TIMEOUT', msg: '请求超时' })
+      }
+    }, timeout || 10000)
+    return pr
+  }
+  Conn.prototype.close = function () {
+    this.closedByUser = true
+    clearTimeout(this.reconnectTimer)
+    this._stopHb()
+    if (this.ws) { try { this.ws.close() } catch (e) {} }
+    this.ws = null
+    this.pending = {}
+  }
+
+  // ------------------------------------------------------------------ App
+  var App = {
+    servers: [], curId: null, conn: null,
+    groups: [], sessions: [],
+    sid: '', meta: {}, msgs: [], before: null, hasMore: false,
+    screen: [], prompt: null, editable: false, loadingOlder: false,
+
+    init: function () {
+      var that = this
+      this.servers = loadServers()
+      this.importFromUrl()
+      this.curId = localStorage.getItem(LS_CURRENT)
+      if (!this._find(this.curId)) this.curId = this.servers.length ? this.servers[0].id : null
+      this.conn = new Conn(function (f) { that.onFrame(f) }, function (s, x) { that.onState(s, x) })
+      this.bindUI()
+      this.renderServerBar()
+      var h = this.parseHash()
+      if (h.srv && this._find(h.srv)) this.curId = h.srv
+      if (!this.servers.length) this.openMgr()
+      else this.switchTo(this.curId, h.sid)
+      window.addEventListener('hashchange', function () {
+        var hh = that.parseHash()
+        if (hh.srv && hh.srv !== that.curId && that._find(hh.srv)) that.switchTo(hh.srv, hh.sid)
+        else if (hh.sid && hh.sid !== that.sid) that.openSession(hh.sid)
+      })
+    },
+
+    /** 支持 ?cfg=<base64 服务器列表> —— 一条链接把配置带到另一台设备（手机）上。 */
+    importFromUrl: function () {
+      var m = /[?&]cfg=([^&]+)/.exec(location.search || '')
+      if (!m) return
+      var list = null
+      try {
+        list = JSON.parse(decodeURIComponent(escape(atob(decodeURIComponent(m[1])))))
+      } catch (e) { return }
+      if (!Array.isArray(list) || !list.length) return
+      var merged = this.servers.slice()
+      list.forEach(function (s) {
+        if (!s || !s.url) return
+        s.id = s.id || ('s' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5))
+        if (!merged.some(function (x) { return x.url === s.url && x.keyId === s.keyId })) merged.push(s)
+      })
+      this.servers = merged
+      saveServers(merged)
+      // 地址栏里别留着密钥
+      history.replaceState(null, '', location.pathname + (location.hash || ''))
+    },
+
+    /** 生成当前配置的分享链接（服务器管理弹层里用） */
+    shareLink: function () {
+      try {
+        var b64 = btoa(unescape(encodeURIComponent(JSON.stringify(this.servers))))
+        return location.origin + location.pathname + '?cfg=' + encodeURIComponent(b64)
+      } catch (e) { return '' }
+    },
+
+    _find: function (id) {
+      for (var i = 0; i < this.servers.length; i++) if (this.servers[i].id === id) return this.servers[i]
+      return null
+    },
+    cur: function () { return this._find(this.curId) },
+
+    parseHash: function () {
+      var out = {}
+      ;(location.hash || '').replace(/^#/, '').split('&').forEach(function (kv) {
+        var p = kv.split('=')
+        if (p[0]) out[p[0]] = decodeURIComponent(p[1] || '')
+      })
+      return out
+    },
+    writeHash: function () {
+      var h = ''
+      if (this.curId) h += 'srv=' + encodeURIComponent(this.curId)
+      if (this.sid) h += (h ? '&' : '') + 'sid=' + encodeURIComponent(this.sid)
+      var next = h ? '#' + h : ''
+      if (location.hash !== next) {
+        history.replaceState(null, '', location.pathname + location.search + next)
+      }
+    },
+
+    // ------------------------------------------------------------ 切换服务器
+    switchTo: function (id, sid) {
+      var that = this
+      this.curId = id
+      localStorage.setItem(LS_CURRENT, id || '')
+      this.groups = []; this.sessions = []; this.sid = ''
+      this.msgs = []; this.screen = []; this.prompt = null
+      this.renderServerBar(); this.renderList(); this.renderMain()
+      var cfg = this.cur()
+      this.writeHash()
+      if (!cfg) { this.conn.close(); return }
+      this.conn.connect(cfg)
+      // 连上后自动重开上次那个会话
+      var want = sid || this.parseHash().sid
+      if (want) this._autoSid = want
+    },
+
+    onState: function (s, extra) {
+      var dot = $('dot'), txt = $('connState')
+      if (s === 'open') {
+        dot.className = 'dot on'; txt.textContent = '已连接'
+        var that = this
+        this.loadList().then(function () {
+          if (that._autoSid) { var s2 = that._autoSid; that._autoSid = null; that.openSession(s2) }
+        })
+      } else if (s === 'connecting') {
+        dot.className = 'dot'; txt.textContent = '连接中…'
+      } else if (s === 'reconnect') {
+        dot.className = 'dot off'; txt.textContent = extra + 's 后重连'
+      } else if (s === 'closed') {
+        dot.className = 'dot off'; txt.textContent = '已断开'
+      } else if (s === 'error') {
+        dot.className = 'dot off'
+        txt.textContent = '连接失败'
+        toast(typeof extra === 'string' ? extra : ((extra && extra.msg) || '连接失败'), 'err')
+      }
+    },
+
+    // ------------------------------------------------------------ 收帧
+    onFrame: function (f) {
+      var name = f.name, p = f.payload || {}, sid = f.sid || p.sid
+      if (name === 'session.message' && sid === this.sid) {
+        var m = { seq: p.seq || 0, role: p.role || 'agent', text: p.text || '', ts: p.ts }
+        if (!this.msgs.some(function (x) { return x.seq && x.seq === m.seq })) {
+          this.msgs.push(m)
+          this.renderMsgs()
+        }
+        return
+      }
+      if (name === 'output.delta' && sid === this.sid) {
+        this.screen = (p.lines || []).slice(-200)
+        this.renderScreen()
+        return
+      }
+      if (name === 'session.prompt' && sid === this.sid) {
+        if (p.state === 'open') this.prompt = p
+        else if (!this.prompt || this.prompt.pid === p.pid) this.prompt = null
+        this.renderPrompt()
+        return
+      }
+      if (name === 'session.state' && sid === this.sid) {
+        $('sessState').textContent = p.status || ''
+        return
+      }
+      if (name === 'device.state' || name === 'session.index') {
+        this.loadList()
+        return
+      }
+      if (name === 'pong') return
+    },
+
+    // ------------------------------------------------------------ 列表
+    loadList: function () {
+      var that = this
+      return this.conn.req('session.list', {}, 10000).then(function (r) {
+        var pl = r.payload || {}
+        that.groups = pl.groups || []
+        that.sessions = pl.sessions || []
+        that.renderList()
+      }).catch(function (e) {
+        $('list').innerHTML = '<div class="empty">会话列表拉取失败：' + esc((e && e.msg) || '') + '</div>'
+      })
+    },
+
+    renderServerBar: function () {
+      var sel = $('srvSel')
+      var that = this
+      sel.innerHTML = ''
+      this.servers.forEach(function (s) {
+        var o = document.createElement('option')
+        o.value = s.id
+        o.textContent = titleOf(s)
+        if (s.id === that.curId) o.selected = true
+        sel.appendChild(o)
+      })
+      if (!this.servers.length) {
+        var o2 = document.createElement('option')
+        o2.textContent = '（还没有服务器）'
+        sel.appendChild(o2)
+      }
+    },
+
+    renderList: function () {
+      var el = $('list')
+      if (!this.groups.length) {
+        el.innerHTML = '<div class="empty">这台服务器上还没有会话<br>'
+          + '<span class="hint">机器上要跑 sbp-server，并且面板带 --bridge 上报</span></div>'
+        return
+      }
+      var that = this
+      var html = ''
+      this.groups.forEach(function (g) {
+        var online = g.live
+        html += '<div class="grp"><span class="dot ' + (online ? 'on' : 'off') + '"></span>'
+          + '<span class="gn">' + esc(g.name || '设备') + '</span>'
+          + (g.cwd ? '<span class="gc">' + esc(g.cwd) + '</span>' : '')
+          + '<span class="gcnt">' + (g.count || 0) + '</span></div>'
+        ;(g.items || []).forEach(function (it) {
+          html += '<div class="item' + (it.sid === that.sid ? ' on' : '') + '" data-sid="' + esc(it.sid) + '">'
+            + '<div class="it">' + esc(it.title || it.short || it.sid) + '</div>'
+            + '<div class="is">' + esc(it.subtitle || '') + '</div>'
+            + '<div class="im">' + esc(it.kind || '') + (it.count ? ' · ' + it.count + ' 条' : '')
+            + (it.status === 'running' ? ' · <b class="run">运行中</b>' : '') + '</div>'
+            + '</div>'
+        })
+      })
+      el.innerHTML = html
+      Array.prototype.forEach.call(el.querySelectorAll('.item'), function (n) {
+        n.onclick = function () { that.openSession(n.getAttribute('data-sid')) }
+      })
+    },
+
+    // ------------------------------------------------------------ 打开会话
+    openSession: function (sid) {
+      var that = this
+      if (this.sid && this.sid !== sid) {
+        this.conn.req('session.detach', { sid: this.sid }, 5000).catch(function () {})
+      }
+      this.sid = sid
+      this.msgs = []; this.screen = []; this.prompt = null; this.before = null
+      this.writeHash()
+      this.renderList(); this.renderMain()
+      var meta = null
+      for (var i = 0; i < this.sessions.length; i++) if (this.sessions[i].sid === sid) meta = this.sessions[i]
+      $('sessTitle').textContent = (meta && (meta.title || meta.short)) || sid
+      $('sessSid').textContent = sid
+      this.conn.req('session.attach', { sid: sid }, 10000).then(function (r) {
+        var pl = r.payload || {}
+        that.editable = !!pl.editable
+        that.prompt = pl.prompt || null
+        $('composerWrap').hidden = !that.editable
+        that.renderPrompt()
+        return that.loadHistory()
+      }).catch(function (e) {
+        $('msgs').innerHTML = '<div class="empty">打不开会话：' + esc((e && e.msg) || '') + '</div>'
+      })
+    },
+
+    loadHistory: function (before) {
+      var that = this
+      var pl = { sid: this.sid, limit: 20 }
+      if (before) pl.before = before
+      return this.conn.req('session.history', pl, 10000).then(function (r) {
+        var d = r.payload || {}
+        var items = d.items || []
+        that.hasMore = !!d.has_more
+        that.before = d.next_before
+        if (before) that.msgs = items.concat(that.msgs)
+        else that.msgs = items
+        that.renderMsgs(before ? 'keep' : 'bottom')
+      }).catch(function (e) {
+        $('msgs').innerHTML = '<div class="empty">历史拉取失败：' + esc((e && e.msg) || '') + '</div>'
+      })
+    },
+
+    // ------------------------------------------------------------ 渲染
+    renderMain: function () {
+      var empty = !this.sid
+      $('empty').hidden = !empty
+      $('stream').hidden = empty
+      $('composerWrap').hidden = empty || !this.editable
+      $('screenWrap').hidden = empty
+      $('prompts').hidden = true
+      if (empty) { $('sessTitle').textContent = '未选择会话'; $('sessSid').textContent = '' }
+    },
+
+    renderMsgs: function (mode) {
+      var el = $('msgs')
+      var html = ''
+      if (this.hasMore) html += '<div class="more" id="moreBtn">↑ 加载更早</div>'
+      this.msgs.forEach(function (m) {
+        var who = m.role === 'user' ? '我' : (m.role === 'agent' || m.role === 'assistant' ? 'agent' : m.role)
+        html += '<div class="msg ' + (m.role === 'user' ? 'user' : '') + '">'
+          + '<div class="who">' + esc(who) + '</div>'
+          + '<div class="bub">' + esc(m.text || '') + '</div></div>'
+      })
+      if (!this.msgs.length) html += '<div class="empty">这个会话还没有可展示的历史</div>'
+      el.innerHTML = html
+      var that = this
+      var more = $('moreBtn')
+      if (more) {
+        more.onclick = function () {
+          if (that.loadingOlder || !that.before) return
+          that.loadingOlder = true
+          more.textContent = '加载中…'
+          var near = el.scrollHeight
+          that.loadHistory(that.before).then(function () {
+            that.loadingOlder = false
+            // 保持视口：插入内容后把滚动位置补回来
+            el.scrollTop += el.scrollHeight - near
+          })
+        }
+      }
+      if (mode !== 'keep') el.scrollTop = el.scrollHeight
+    },
+
+    renderScreen: function () {
+      var pre = $('screen')
+      pre.textContent = this.screen.join('\n')
+      $('screenWrap').hidden = !this.sid
+      pre.scrollTop = pre.scrollHeight
+    },
+
+    renderPrompt: function () {
+      var el = $('prompts')
+      var p = this.prompt
+      if (!p || p.state === 'answered' || p.state === 'gone') { el.hidden = true; el.innerHTML = ''; return }
+      var that = this
+      var html = '<div class="pcard ' + (p.risk || 'safe') + '">'
+        + '<div class="ptitle">' + esc(p.title || '请选择') + '</div>'
+        + (p.detail ? '<div class="pdetail">' + esc(p.detail) + '</div>' : '')
+        + '<div class="pops">'
+      ;(p.options || []).forEach(function (o) {
+        html += '<button class="popt ' + (o.risk || 'safe') + (o.default ? ' def' : '') + '" '
+          + 'data-idx="' + o.index + '">' + esc(o.label || '')
+          + (o.desc ? '<span class="pdesc">' + esc(o.desc) + '</span>' : '') + '</button>'
+      })
+      html += '<button class="popt ghost" data-dismiss="1">忽略</button></div></div>'
+      el.innerHTML = html
+      el.hidden = false
+      Array.prototype.forEach.call(el.querySelectorAll('.popt'), function (b) {
+        b.onclick = function () {
+          if (b.getAttribute('data-dismiss')) return that.answer({ dismiss: true })
+          var idx = +b.getAttribute('data-idx')
+          var danger = b.className.indexOf('danger') > -1
+          if (danger && !confirm('确认选择「' + b.textContent.split('\n')[0] + '」？')) return
+          that.answer({ choice: idx })
+        }
+      })
+    },
+
+    answer: function (extra) {
+      var that = this
+      var pl = { sid: this.sid, pid: this.prompt ? this.prompt.pid : '' }
+      for (var k in extra) pl[k] = extra[k]
+      return this.conn.req('session.answer', pl, 12000).then(function () {
+        that.prompt = null
+        that.renderPrompt()
+        toast('已作答')
+      }).catch(function (e) {
+        toast('作答失败：' + ((e && e.msg) || ''), 'err')
+        if (e && e.code === 'E_PROMPT_STALE') { that.prompt = null; that.renderPrompt() }
+      })
+    },
+
+    send: function () {
+      var ta = $('input')
+      var text = ta.value
+      if (!text.trim()) return
+      var that = this
+      this.conn.req('session.input', { sid: this.sid, text: text, submit: true }, 10000).then(function () {
+        ta.value = ''
+        toast('已发送')
+      }).catch(function (e) { toast('发送失败：' + ((e && e.msg) || ''), 'err') })
+    },
+
+    // ------------------------------------------------------------ 服务器管理
+    openMgr: function () {
+      $('mgr').hidden = false
+      this.renderMgr()
+    },
+    renderMgr: function () {
+      var that = this
+      var el = $('mgrList')
+      if (!this.servers.length) {
+        el.innerHTML = '<div class="empty">还没有服务器，先加一台</div>'
+      } else {
+        var html = ''
+        this.servers.forEach(function (s, i) {
+          html += '<div class="mrow"><span class="mname">' + esc(titleOf(s)) + '</span>'
+            + '<span class="murl">' + esc(s.url) + '</span>'
+            + '<span class="mauth">' + esc(s.auth) + (s.auth === 'hmac' ? ' · ' + esc(s.keyId) : '') + '</span>'
+            + '<button class="mini" data-act="use" data-i="' + i + '">切换</button>'
+            + '<button class="mini" data-act="edit" data-i="' + i + '">编辑</button>'
+            + '<button class="mini danger" data-act="del" data-i="' + i + '">删除</button></div>'
+        })
+        el.innerHTML = html
+        Array.prototype.forEach.call(el.querySelectorAll('button'), function (b) {
+          b.onclick = function () {
+            var i = +b.getAttribute('data-i'), act = b.getAttribute('data-act')
+            if (act === 'use') { that.switchTo(that.servers[i].id); $('mgr').hidden = true }
+            if (act === 'edit') that.editForm(i)
+            if (act === 'del') {
+              if (!confirm('删除「' + titleOf(that.servers[i]) + '」？')) return
+              that.servers.splice(i, 1)
+              saveServers(that.servers)
+              if (!that._find(that.curId)) that.curId = that.servers.length ? that.servers[0].id : null
+              that.renderServerBar(); that.renderMgr()
+            }
+          }
+        })
+      }
+    },
+    editForm: function (i) {
+      var s = i === null || i === undefined ? blankServer() : this.servers[i]
+      this._editIdx = (i === null || i === undefined) ? null : i
+      $('fName').value = s.name || ''
+      $('fUrl').value = s.url || ''
+      $('fAuth').value = s.auth || 'hmac'
+      $('fKeyId').value = s.keyId || ''
+      $('fSecret').value = s.secret || ''
+      $('fToken').value = s.token || ''
+      this.syncAuthFields()
+      $('fMsg').textContent = ''
+      $('form').hidden = false
+      $('fUrlHint').textContent = wsUrl(s.url) || ''
+    },
+    syncAuthFields: function () {
+      var a = $('fAuth').value
+      $('rowHmac').hidden = a !== 'hmac'
+      $('rowHmac2').hidden = a !== 'hmac'
+      $('rowToken').hidden = a !== 'token' && a !== 'bearer'
+    },
+    saveForm: function () {
+      var s = {
+        id: (this._editIdx === null ? blankServer().id : this.servers[this._editIdx].id),
+        name: $('fName').value.trim(),
+        url: $('fUrl').value.trim(),
+        auth: $('fAuth').value,
+        keyId: $('fKeyId').value.trim(),
+        secret: $('fSecret').value.trim(),
+        token: $('fToken').value.trim()
+      }
+      if (!wsUrl(s.url)) { $('fMsg').textContent = '地址看不懂，示例：wss://host:8787/ws 或 https://host/sbp'; return }
+      if (s.auth === 'hmac' && !s.secret) { $('fMsg').textContent = 'HMAC 模式要填 secret'; return }
+      if (this._editIdx === null) this.servers.push(s)
+      else this.servers[this._editIdx] = s
+      saveServers(this.servers)
+      $('form').hidden = true
+      this.renderServerBar(); this.renderMgr()
+      toast('已保存')
+    },
+    testForm: function () {
+      var that = this
+      var s = {
+        name: $('fName').value.trim(), url: $('fUrl').value.trim(), auth: $('fAuth').value,
+        keyId: $('fKeyId').value.trim(), secret: $('fSecret').value.trim(), token: $('fToken').value.trim()
+      }
+      var url = wsUrl(s.url)
+      if (!url) { $('fMsg').textContent = '地址看不懂'; return }
+      $('fMsg').textContent = '正在连接 ' + url + ' …'
+      var c = new Conn(function () {}, function (st, x) {})
+      c.connect(s)
+      var done = false
+      var t0 = setTimeout(function () {
+        if (done) return
+        done = true; c.close(); $('fMsg').textContent = '✗ 超时：握手没回来（地址/证书/密钥？）'
+      }, 12000)
+      c._probe = setInterval(function () {
+        if (done) return
+        if (c.state === 'open') {
+          done = true; clearTimeout(t0); clearInterval(c._probe)
+          c.req('session.list', {}, 8000).then(function (r) {
+            var n = 0
+            ;((r.payload || {}).groups || []).forEach(function (g) { n += (g.items || []).length })
+            $('fMsg').textContent = '✓ 已连接 · 设备 ' + ((r.payload || {}).groups || []).length + ' 台 · 会话 ' + n + ' 个'
+            c.close()
+          }).catch(function (e) {
+            $('fMsg').textContent = '✗ ' + ((e && e.msg) || '拉取会话失败')
+            c.close()
+          })
+        } else if (c.state === 'error') {
+          done = true; clearTimeout(t0); clearInterval(c._probe)
+          $('fMsg').textContent = '✗ ' + (typeof x === 'string' ? '' : '') + (c._lastErr || '连接失败')
+          c.close()
+        }
+      }, 300)
+    },
+
+    // ------------------------------------------------------------ UI 绑定
+    bindUI: function () {
+      var that = this
+      $('srvSel').onchange = function () { that.switchTo($('srvSel').value) }
+      $('btnMgr').onclick = function () { that.openMgr() }
+      $('mgrClose').onclick = function () { $('mgr').hidden = true }
+      $('mgrAdd').onclick = function () { that.editForm(null) }
+      $('mgrShare').onclick = function () {
+        var link = that.shareLink()
+        if (!link) { toast('生成链接失败', 'err'); return }
+        var done = function () { toast('已复制配置链接（含密钥，别乱发）') }
+        if (navigator.clipboard && navigator.clipboard.writeText) {
+          navigator.clipboard.writeText(link).then(done, function () { prompt('复制这条链接：', link) })
+        } else {
+          prompt('复制这条链接：', link)
+        }
+      }
+      $('formCancel').onclick = function () { $('form').hidden = true }
+      $('formSave').onclick = function () { that.saveForm() }
+      $('formTest').onclick = function () { that.testForm() }
+      $('fAuth').onchange = function () { that.syncAuthFields() }
+      $('fUrl').oninput = function () { $('fUrlHint').textContent = wsUrl($('fUrl').value) }
+      $('btnRefresh').onclick = function () { that.loadList() }
+      $('btnSnap').onclick = function () {
+        if (!that.sid) return
+        that.conn.req('pane.snapshot', { sid: that.sid, lines: 120 }, 10000).then(function (r) {
+          that.screen = (r.payload || {}).lines || []
+          that.renderScreen()
+          var p = (r.payload || {}).prompt
+          if (p) { that.prompt = p; that.renderPrompt() }
+        }).catch(function (e) { toast('抓屏失败：' + ((e && e.msg) || ''), 'err') })
+      }
+      $('screenHead').onclick = function () {
+        var w = $('screenWrap')
+        w.className = w.className === 'screen-wrap' ? 'screen-wrap closed' : 'screen-wrap'
+      }
+      $('send').onclick = function () { that.send() }
+      $('input').onkeydown = function (e) {
+        if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); that.send() }
+      }
+      $('btnEsc').onclick = function () {
+        that.conn.req('session.input', { sid: that.sid, kind: 'key', key: 'ESC' }, 8000).catch(function () {})
+      }
+      $('btnMenu').onclick = function () {
+        document.body.className = document.body.className === 'sb-open' ? '' : 'sb-open'
+      }
+    }
+  }
+
+  window.addEventListener('DOMContentLoaded', function () { App.init() })
+})()
