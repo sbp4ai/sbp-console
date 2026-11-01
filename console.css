@@ -63,7 +63,14 @@ code{background:#f1f3f7;border-radius:4px;padding:1px 4px;font-size:11.5px}
 
 .empty{color:var(--mu);text-align:center;padding:60px 16px;flex:1 1 auto}
 .empty .big{font-size:34px;opacity:.5;margin-bottom:8px}
-.stream{flex:1 1 auto;overflow:auto;min-height:0;padding:12px 14px 8px}
+.stream{flex:1 1 auto;min-height:0;display:flex;flex-direction:column;overflow:hidden}
+.stream-head{display:flex;align-items:center;gap:6px;padding:7px 12px;font-size:11.5px;color:var(--mu);cursor:pointer;flex:0 0 auto;border-bottom:1px solid var(--bd)}
+.stream-head .caret{transition:.15s}
+.stream.closed{flex:0 0 auto}
+.stream.closed .stream-head{border-bottom:0}
+.stream.closed .caret{transform:rotate(-90deg)}
+.stream.closed #msgs{display:none}
+#msgs{flex:1 1 auto;overflow:auto;min-height:0;padding:12px 14px 8px}
 .msg{margin-bottom:10px;max-width:min(860px,94%)}
 .msg.user{margin-left:auto}
 .msg .who{font-size:10px;color:#9ca3af;margin-bottom:3px}
@@ -77,6 +84,8 @@ code{background:#f1f3f7;border-radius:4px;padding:1px 4px;font-size:11.5px}
 .more{text-align:center;color:var(--mu);font-size:11.5px;padding:6px 0 12px;cursor:pointer}
 
 .screen-wrap{flex:0 0 auto;border-top:1px solid var(--bd);background:var(--card);display:flex;flex-direction:column;max-height:42vh}
+/* 会话历史收起时，把腾出的高度全给实时屏幕 */
+.stream.closed + .screen-wrap{flex:1 1 auto;max-height:none}
 .screen-head{display:flex;align-items:center;gap:6px;padding:7px 12px;font-size:11.5px;color:var(--mu);cursor:pointer;flex:0 0 auto}
 .screen-head .caret{transition:.15s}
 .screen-wrap.closed .caret{transform:rotate(-90deg)}

@@ -703,6 +703,10 @@
           if (p) { that.prompt = p; that.renderPrompt() }
         }).catch(function (e) { toast('抓屏失败：' + ((e && e.msg) || ''), 'err') })
       }
+      $('streamHead').onclick = function () {
+        var s = $('stream')
+        s.className = s.className === 'stream' ? 'stream closed' : 'stream'
+      }
       $('screenHead').onclick = function () {
         var w = $('screenWrap')
         w.className = w.className === 'screen-wrap' ? 'screen-wrap closed' : 'screen-wrap'

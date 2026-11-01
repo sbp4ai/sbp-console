@@ -43,9 +43,14 @@
       <div class="hint">左上角下拉切换服务器</div>
     </div>
 
-    <div class="stream" id="stream" hidden><div id="msgs"></div></div>
+    <div class="stream" id="stream" hidden>
+      <div class="stream-head" id="streamHead">
+        <span class="caret">▾</span><span>会话历史</span>
+      </div>
+      <div id="msgs"></div>
+    </div>
 
-    <div class="screen-wrap closed" id="screenWrap" hidden>
+    <div class="screen-wrap" id="screenWrap" hidden>
       <div class="screen-head" id="screenHead">
         <span class="caret">▾</span><span>实时屏幕</span>
       </div>
