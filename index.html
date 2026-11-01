@@ -81,6 +81,21 @@
     </div>
     <div class="sheet-body" id="mgrList"></div>
 
+    <!-- 一键导入：把 sbp-agent 生成的 .copy4client 整段粘进来 -->
+    <div class="paste-box">
+      <div class="paste-head">
+        <b>粘贴导入</b>
+        <span class="hint">在机器上 <code>cat .copy4client</code>，整段复制粘进下面（含私钥，别贴到公开地方）</span>
+      </div>
+      <textarea id="mgrPaste" rows="4" spellcheck="false"
+        placeholder="# 粘贴 .copy4client 的内容（sbp1. 开头的连接串），或 ?cfg= 分享链接"></textarea>
+      <div class="fbtns">
+        <button class="mini primary" id="mgrImport">导入</button>
+        <button class="mini" id="mgrPasteClear" type="button">清空</button>
+        <span class="fmsg" id="mgrImportMsg"></span>
+      </div>
+    </div>
+
     <div class="form" id="form" hidden>
       <div class="frow"><label>名称</label><input id="fName" placeholder="例如 ECS / GPU 家机"></div>
       <div class="frow"><label>地址</label><input id="fUrl" placeholder="wss://tools.example.com/sbp22" autocomplete="off"></div>
@@ -96,6 +111,24 @@
       <div class="frow" id="rowHmac"><label>keyId</label><input id="fKeyId" placeholder="ecs" autocomplete="off"></div>
       <div class="frow" id="rowHmac2"><label>secret</label><input id="fSecret" type="password" autocomplete="new-password"></div>
       <div class="frow" id="rowToken" hidden><label>token</label><input id="fToken" autocomplete="off"></div>
+
+      <!-- SBP-0.4：端到端加密。开启后，转发服务器只看到密文 + 不透明 tag，看不到 prompt/历史。 -->
+      <div class="frow"><label>E2EE</label>
+        <label class="switch"><input type="checkbox" id="fE2ee"> 端到端加密（中转不可读）</label>
+      </div>
+      <div id="e2eeBox" hidden>
+        <div class="frow"><label>设备 DID</label><input id="fDid" placeholder="与 sbp-agent 的 SBP_E2EE_DID 一致" autocomplete="off"></div>
+        <div class="frow"><label>本机 keyId</label><input id="fMyKeyId" placeholder="cli（在 dispatcher 的 SBP_TRUSTED_KEYS 登记）" autocomplete="off"></div>
+        <div class="frow"><label>路由密钥 rk</label><input id="fRk" placeholder="64-hex，或口令（两端必须一致）" autocomplete="new-password"></div>
+        <div class="frow"><label>对端 keyId</label><input id="fPeerKeyId" placeholder="dev（sbp-agent 的 SBP_E2EE_KEY_ID）" autocomplete="off"></div>
+        <div class="frow"><label>对端 box 公钥</label><input id="fPeerBoxPk" autocomplete="off" spellcheck="false"></div>
+        <div class="frow"><label>对端 sign 公钥</label><input id="fPeerSignPk" autocomplete="off" spellcheck="false"></div>
+        <div class="frow"><label>我的密钥</label>
+          <button class="mini" id="fGenKeys" type="button">生成 / 显示我的公钥</button>
+          <span class="hint" id="fMyKeys"></span>
+        </div>
+      </div>
+
       <div class="frow"><label></label>
         <div class="fbtns">
           <button class="mini" id="formTest">测试连接</button>
@@ -116,7 +149,9 @@
 <div class="toast" id="toast"></div>
 <div class="scrim" id="scrim"></div>
 
+<script src="libsodium.js"></script>
 <script src="hmac.js"></script>
+<script src="e2ee.js"></script>
 <script src="console.js"></script>
 </body>
 </html>

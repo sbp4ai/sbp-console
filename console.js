@@ -39,8 +39,8 @@
   }
 
   // ------------------------------------------------------------------ 地址
-  /** scheme://host:port/path 一律补全成 ws(s) 地址，缺省路径 /ws */
-  function wsUrl(raw) {
+  /** scheme://host:port/path 一律补全成 ws(s) 地址，缺省路径 /ws（E2EE 用 /ws-e2ee） */
+  function wsUrl(raw, e2ee) {
     var s = String(raw || '').trim().replace(/\/+$/, '')
     if (!s) return ''
     var scheme = 'wss'
@@ -51,11 +51,13 @@
     var slash = s.indexOf('/')
     var hostport = slash > -1 ? s.slice(0, slash) : s
     var path = slash > -1 ? s.slice(slash) : '/ws'
-    if (!path || path === '/') path = '/ws'
+    if (!path || path === '/') path = e2ee ? '/ws-e2ee' : '/ws'
     // 写成 wss://host/sbp-ecs 时，nginx 的 location 是 /sbp-ecs/，
     // 少了那道斜杠会被 301 —— WebSocket 握手吃不下 301，所以这里补成 /sbp-ecs/ws
-    else if (!/\/(ws|sbp)$/.test(path) && !path.endsWith('/ws')) {
+    else if (!e2ee && !/\/(ws|sbp)$/.test(path) && !path.endsWith('/ws')) {
       path = path.replace(/\/+$/, '') + '/ws'
+    } else if (e2ee && !/\/ws-e2ee$/.test(path) && !path.endsWith('/ws-e2ee')) {
+      path = path.replace(/\/+$/, '') + '/ws-e2ee'
     }
     return scheme + '://' + hostport + path
   }
@@ -80,7 +82,9 @@
   function saveServers(list) { localStorage.setItem(LS_SERVERS, JSON.stringify(list)) }
   function blankServer() {
     return { id: 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5),
-             name: '', url: 'wss://', auth: 'hmac', keyId: '', secret: '', token: '' }
+             name: '', url: 'wss://', auth: 'hmac', keyId: '', secret: '', token: '',
+             e2ee: false, did: '', myKeyId: 'cli', rk: '',
+             peerKeyId: 'dev', peerBoxPk: '', peerSignPk: '' }
   }
   function titleOf(s) { return s.name || s.url || '未命名' }
 
@@ -107,8 +111,10 @@
     this.close()
     this.cfg = cfg
     this.closedByUser = false
+    this.link = null
+    this._e2eeOpen = false
     var that = this
-    var url = wsUrl(cfg.url)
+    var url = wsUrl(cfg.url, cfg.e2ee)
     if (!url) { this._setState('error', '地址为空'); return }
     this._setState('connecting', url)
     var ws
@@ -117,6 +123,16 @@
     ws.onopen = function () {
       that.lastRecv = Date.now()
       that.retry = 0
+      // ---- E2EE 握手：发签名挑战，等 hello.ok，再订阅设备 tag ----
+      if (cfg.e2ee) {
+        SbpE2EE.ready.then(function () {
+          var link
+          try { link = buildLink(cfg) } catch (e) { that._setState('error', 'E2EE 配置错误：' + e.message); ws.close(); return }
+          that.link = link
+          that.ws.send(JSON.stringify(link.hello()))
+        }).catch(function () { that._setState('error', 'libsodium 初始化失败'); ws.close() })
+        return
+      }
       var hp = { role: 'client' }
       if (cfg.auth === 'hmac') hp.auth = window.SbpHmac.auth(cfg)
       else if ((cfg.auth === 'token' || cfg.auth === 'bearer') && cfg.token) hp.token = cfg.token
@@ -132,6 +148,19 @@
       that.lastRecv = Date.now()
       var f
       try { f = JSON.parse(ev.data) } catch (e) { return }
+      if (that.link) {
+        if (f.ctl) return                                  // 中继控制帧（sub/unsub），本地忽略
+        if (f.cipher) {                                    // 信封：解密成内层帧
+          try { f = that.link.recv(f) } catch (e) { return }
+        }
+        // 否则是明文的中继帧（如 hello.ok），原样透传
+      }
+      if (f.type === 'res' && f.name === 'hello.ok' && that.link && !that._e2eeOpen) {
+        that._e2eeOpen = true
+        that.ws.send(JSON.stringify(that.link.subscribe(that.link.deviceScope())))
+        that._setState('open', (f.payload || {}))
+        return
+      }
       if (f.type === 'res' && f.ref && that.pending[f.ref]) {
         var p = that.pending[f.ref]
         delete that.pending[f.ref]
@@ -180,7 +209,20 @@
     var pr = new Promise(function (res, rej) { p.resolve = res; p.reject = rej })
     this.pending[id] = p
     try {
-      this.ws.send(JSON.stringify({ v: V, id: id, type: 'req', name: name, payload: payload || {} }))
+      var frame
+      if (this.link) {
+        // E2EE：把内层 SBP 帧封进信封（按 tag 路由、对端公钥加密、本机签名）
+        var inner = { v: V, id: id, type: 'req', name: name, payload: payload || {} }
+        var sid = (payload && payload.sid) || null
+        if (sid) inner.sid = sid
+        var scope = sid ? this.link.sessionScope(sid) : this.link.deviceScope()
+        frame = this.link.send(inner, scope)
+      } else {
+        frame = { v: V, id: id, type: 'req', name: name, payload: payload || {} }
+        var s = (payload && payload.sid) || null
+        if (s) frame.sid = s
+      }
+      this.ws.send(JSON.stringify(frame))
     } catch (e) {
       delete this.pending[id]
       return Promise.reject({ code: 'E_SEND', msg: '发送失败' })
@@ -200,6 +242,61 @@
     if (this.ws) { try { this.ws.close() } catch (e) {} }
     this.ws = null
     this.pending = {}
+  }
+  // ---- E2EE：订阅 / 退订某个会话 tag（让中继把该会话的密文投给我们） ----
+  Conn.prototype.subscribeSession = function (sid) {
+    if (this.link && this.ws && this.ws.readyState === 1)
+      this.ws.send(JSON.stringify(this.link.subscribe(this.link.sessionScope(sid))))
+  }
+  Conn.prototype.unsubscribeSession = function (sid) {
+    if (this.link && this.ws && this.ws.readyState === 1)
+      this.ws.send(JSON.stringify(this.link.unsubscribe(this.link.sessionScope(sid))))
+  }
+
+  // ------------------------------------------------------------------ 导入
+  // sbp1. 连接串的解析放在 e2ee.js 里，控制台和小程序共用一份
+  var CONNECT_PREFIX = SbpE2EE.CONNECT_PREFIX
+  function newId() {
+    return 's' + Date.now().toString(36) + Math.random().toString(36).slice(2, 5)
+  }
+  function parseImportText(text) { return SbpE2EE.parseConnectText(text) }
+
+  // ------------------------------------------------------------------ E2EE 链路构造
+  /** 从服务器配置 + 本地 localStorage 构造 E2EELink。本机私钥只存在 localStorage。 */
+  function buildLink(cfg) {
+    var storeKey = 'sbp_e2ee_' + cfg.id
+    var stored = null
+    try { stored = JSON.parse(localStorage.getItem(storeKey) || 'null') } catch (e) {}
+    // 导入进来的连接串自带私钥，优先用它（中继那边已经登记过这对公钥了）
+    if (cfg.box_sk && cfg.sign_sk && (!stored || stored.box_sk !== cfg.box_sk)) {
+      stored = {
+        box_sk: cfg.box_sk, sign_sk: cfg.sign_sk,
+        box_pk: cfg.box_pk || '', sign_pk: cfg.sign_pk || ''
+      }
+      try { localStorage.setItem(storeKey, JSON.stringify(stored)) } catch (e) {}
+    }
+    if (!stored || !stored.box_sk || !stored.sign_sk) {
+      var kp = SbpE2EE.generateKeypair()
+      stored = {
+        box_sk: SbpE2EE.b64u_encode(kp.box_sk), sign_sk: SbpE2EE.b64u_encode(kp.sign_sk),
+        box_pk: SbpE2EE.b64u_encode(kp.box_pk), sign_pk: SbpE2EE.b64u_encode(kp.sign_pk)
+      }
+      localStorage.setItem(storeKey, JSON.stringify(stored))
+    }
+    var kp = {
+      box_sk: SbpE2EE.b64u_decode(stored.box_sk),
+      sign_sk: SbpE2EE.b64u_decode(stored.sign_sk)
+    }
+    var rk = SbpE2EE.deriveRk(cfg.rk)
+    return new SbpE2EE.E2EELink({
+      kp: kp,
+      peerBoxPk: SbpE2EE.b64u_decode(cfg.peerBoxPk),
+      peerSignPk: SbpE2EE.b64u_decode(cfg.peerSignPk),
+      rk: rk,
+      keyId: cfg.myKeyId || 'cli',
+      did: cfg.did,
+      role: 'client'
+    })
   }
 
   // ------------------------------------------------------------------ App
@@ -248,6 +345,43 @@
       saveServers(merged)
       // 地址栏里别留着密钥
       history.replaceState(null, '', location.pathname + (location.hash || ''))
+    },
+
+    /** 粘贴导入：.copy4client 整段（可含两台客户端）→ 服务器列表 + 私钥播种。 */
+    importPaste: function (text) {
+      if (text === undefined || text === null) text = $('mgrPaste').value
+      var msg = $('mgrImportMsg')
+      var items = parseImportText(text)
+      if (!items.length) {
+        msg.textContent = '没找到连接串（应含 sbp1. 开头的行）'
+        return 0
+      }
+      var merged = this.servers.slice()
+      var added = 0
+      items.forEach(function (s) {
+        if (!s.url) return
+        var idx = -1
+        for (var i = 0; i < merged.length; i++) {
+          if (merged[i].url === s.url && merged[i].myKeyId === s.myKeyId) { idx = i; break }
+        }
+        if (idx > -1) { s.id = merged[idx].id; merged[idx] = s }
+        else { s.id = newId(); merged.push(s); added += 1 }
+        if (s.box_sk && s.sign_sk) {
+          try {
+            localStorage.setItem('sbp_e2ee_' + s.id, JSON.stringify({
+              box_sk: s.box_sk, sign_sk: s.sign_sk, box_pk: s.box_pk || '', sign_pk: s.sign_pk || ''
+            }))
+          } catch (e) {}
+        }
+      })
+      this.servers = merged
+      saveServers(merged)
+      this.renderServerBar(); this.renderMgr()
+      var n = items.length
+      msg.textContent = '✓ 导入 ' + n + ' 条' + (added < n ? '（更新 ' + (n - added) + ' 条）' : '')
+      toast('已导入 ' + n + ' 条连接信息')
+      if (!this.curId) { this.curId = merged.length ? merged[0].id : null; this.switchTo(this.curId) }
+      return n
     },
 
     /** 生成当前配置的分享链接（服务器管理弹层里用） */
@@ -415,13 +549,15 @@
     },
 
     // ------------------------------------------------------------ 打开会话
-    openSession: function (sid) {
-      var that = this
-      if (this.sid && this.sid !== sid) {
-        this.conn.req('session.detach', { sid: this.sid }, 5000).catch(function () {})
-      }
-      this.sid = sid
-      this.msgs = []; this.screen = []; this.prompt = null; this.before = null
+  openSession: function (sid) {
+    var that = this
+    if (this.sid && this.sid !== sid) {
+      this.conn.unsubscribeSession(this.sid)
+      this.conn.req('session.detach', { sid: this.sid }, 5000).catch(function () {})
+    }
+    this.sid = sid
+    this.conn.subscribeSession(sid)   // 订阅会话 tag，否则收不到设备发来的密文
+    this.msgs = []; this.screen = []; this.prompt = null; this.before = null
       this.writeHash()
       this.renderList(); this.renderMain()
       var meta = null
@@ -604,16 +740,48 @@
       $('fKeyId').value = s.keyId || ''
       $('fSecret').value = s.secret || ''
       $('fToken').value = s.token || ''
+      $('fE2ee').checked = !!s.e2ee
+      $('fDid').value = s.did || ''
+      $('fMyKeyId').value = s.myKeyId || 'cli'
+      $('fRk').value = s.rk || ''
+      $('fPeerKeyId').value = s.peerKeyId || 'dev'
+      $('fPeerBoxPk').value = s.peerBoxPk || ''
+      $('fPeerSignPk').value = s.peerSignPk || ''
+      $('fMyKeys').textContent = ''
       this.syncAuthFields()
       $('fMsg').textContent = ''
       $('form').hidden = false
-      $('fUrlHint').textContent = wsUrl(s.url) || ''
+      $('fUrlHint').textContent = wsUrl(s.url, !!s.e2ee) || ''
     },
     syncAuthFields: function () {
       var a = $('fAuth').value
-      $('rowHmac').hidden = a !== 'hmac'
-      $('rowHmac2').hidden = a !== 'hmac'
-      $('rowToken').hidden = a !== 'token' && a !== 'bearer'
+      var e2ee = $('fE2ee').checked
+      $('rowHmac').hidden = e2ee || a !== 'hmac'
+      $('rowHmac2').hidden = e2ee || a !== 'hmac'
+      $('rowToken').hidden = e2ee || (a !== 'token' && a !== 'bearer')
+      $('e2eeBox').hidden = !e2ee
+    },
+    /** 生成（仅一次）本机密钥对，显示公钥供在 sbp-agent / dispatcher 上登记。 */
+    genKeys: function () {
+      var that = this
+      SbpE2EE.ready.then(function () {
+        var id = (that._editIdx === null) ? 'tmp' : that.servers[that._editIdx].id
+        var storeKey = 'sbp_e2ee_' + id
+        var stored = null
+        try { stored = JSON.parse(localStorage.getItem(storeKey) || 'null') } catch (e) {}
+        if (!stored || !stored.box_pk) {
+          var kp = SbpE2EE.generateKeypair()
+          stored = {
+            box_sk: SbpE2EE.b64u_encode(kp.box_sk), sign_sk: SbpE2EE.b64u_encode(kp.sign_sk),
+            box_pk: SbpE2EE.b64u_encode(kp.box_pk), sign_pk: SbpE2EE.b64u_encode(kp.sign_pk)
+          }
+          localStorage.setItem(storeKey, JSON.stringify(stored))
+        }
+        $('fMyKeys').innerHTML = '本机 box 公钥：<code>' + stored.box_pk + '</code><br>'
+          + '本机 sign 公钥：<code>' + stored.sign_pk + '</code><br>'
+          + '<span class="hint">把这两个公钥分别登记到 sbp-agent 的 SBP_E2EE_PEERS 和 dispatcher 的 SBP_TRUSTED_KEYS（keyId='
+          + ($('fMyKeyId').value || 'cli') + '）。</span>'
+      }).catch(function () { $('fMyKeys').textContent = 'libsodium 尚未就绪' })
     },
     saveForm: function () {
       var s = {
@@ -623,10 +791,29 @@
         auth: $('fAuth').value,
         keyId: $('fKeyId').value.trim(),
         secret: $('fSecret').value.trim(),
-        token: $('fToken').value.trim()
+        token: $('fToken').value.trim(),
+        e2ee: $('fE2ee').checked,
+        did: $('fDid').value.trim(),
+        myKeyId: $('fMyKeyId').value.trim() || 'cli',
+        rk: $('fRk').value.trim(),
+        peerKeyId: $('fPeerKeyId').value.trim() || 'dev',
+        peerBoxPk: $('fPeerBoxPk').value.trim(),
+        peerSignPk: $('fPeerSignPk').value.trim()
       }
-      if (!wsUrl(s.url)) { $('fMsg').textContent = '地址看不懂，示例：wss://host:8787/ws 或 https://host/sbp'; return }
-      if (s.auth === 'hmac' && !s.secret) { $('fMsg').textContent = 'HMAC 模式要填 secret'; return }
+      var old = this._editIdx === null ? null : this.servers[this._editIdx]
+      if (old) {
+        // 导入进来的连接串自带私钥，表单里没有这两项，编辑保存时别给冲掉
+        var keep = ['box_sk', 'sign_sk', 'box_pk', 'sign_pk']
+        for (var ki = 0; ki < keep.length; ki++) {
+          if (!s[keep[ki]]) s[keep[ki]] = old[keep[ki]] || ''
+        }
+      }
+      if (!wsUrl(s.url, s.e2ee)) { $('fMsg').textContent = '地址看不懂，示例：wss://host:8787/ws 或 https://host/sbp'; return }
+      if (s.auth === 'hmac' && !s.secret && !s.e2ee) { $('fMsg').textContent = 'HMAC 模式要填 secret'; return }
+      if (s.e2ee) {
+        if (!s.did || !s.rk || !s.peerKeyId || !s.peerBoxPk || !s.peerSignPk)
+          { $('fMsg').textContent = 'E2EE 要填：设备 DID、路由密钥 rk、对端 keyId / box 公钥 / sign 公钥'; return }
+      }
       if (this._editIdx === null) this.servers.push(s)
       else this.servers[this._editIdx] = s
       saveServers(this.servers)
@@ -636,11 +823,17 @@
     },
     testForm: function () {
       var that = this
+      var _old = this._editIdx === null ? null : this.servers[this._editIdx]
       var s = {
         name: $('fName').value.trim(), url: $('fUrl').value.trim(), auth: $('fAuth').value,
-        keyId: $('fKeyId').value.trim(), secret: $('fSecret').value.trim(), token: $('fToken').value.trim()
+        keyId: $('fKeyId').value.trim(), secret: $('fSecret').value.trim(), token: $('fToken').value.trim(),
+        e2ee: $('fE2ee').checked, did: $('fDid').value.trim(), myKeyId: $('fMyKeyId').value.trim() || 'cli',
+        rk: $('fRk').value.trim(), peerKeyId: $('fPeerKeyId').value.trim() || 'dev',
+        peerBoxPk: $('fPeerBoxPk').value.trim(), peerSignPk: $('fPeerSignPk').value.trim(),
+        box_sk: (_old && _old.box_sk) || '', sign_sk: (_old && _old.sign_sk) || ''
       }
-      var url = wsUrl(s.url)
+      s.id = (_old && _old.id) || newId()
+      var url = wsUrl(s.url, s.e2ee)
       if (!url) { $('fMsg').textContent = '地址看不懂'; return }
       $('fMsg').textContent = '正在连接 ' + url + ' …'
       var c = new Conn(function () {}, function (st, x) {})
@@ -688,11 +881,15 @@
           prompt('复制这条链接：', link)
         }
       }
+      $('mgrImport').onclick = function () { that.importPaste() }
+      $('mgrPasteClear').onclick = function () { $('mgrPaste').value = ''; $('mgrImportMsg').textContent = '' }
       $('formCancel').onclick = function () { $('form').hidden = true }
       $('formSave').onclick = function () { that.saveForm() }
       $('formTest').onclick = function () { that.testForm() }
       $('fAuth').onchange = function () { that.syncAuthFields() }
-      $('fUrl').oninput = function () { $('fUrlHint').textContent = wsUrl($('fUrl').value) }
+      $('fE2ee').onchange = function () { that.syncAuthFields() }
+      $('fGenKeys').onclick = function () { that.genKeys() }
+      $('fUrl').oninput = function () { $('fUrlHint').textContent = wsUrl($('fUrl').value, $('fE2ee').checked) }
       $('btnRefresh').onclick = function () { that.loadList() }
       $('btnSnap').onclick = function () {
         if (!that.sid) return

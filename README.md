@@ -25,7 +25,31 @@ open index.html
 #    location /sbp-console/ { alias /path/to/sbp-console/; index index.html; }
 ```
 
-## 加一台服务器
+## 最省事的一条路：粘贴导入（E2EE）
+
+机器上装了 [`sbp-agents`](https://pypi.org/project/sbp-agents/) 的话，启动后它会把连接信息
+写到 `.copy4client` 并在终端打印出来：
+
+```bash
+cat .copy4client        # 整段复制
+```
+
+粘进控制台 ⚙ → **粘贴导入** 框 → 点「导入」，一次导入两台客户端（网页控制台 + 微信小程序），
+每台自带私钥 —— DID / rk / 公钥都不用手填。中继那边用 `cat .copy4relay` 那行
+`SBP_TRUSTED_KEYS=` 启动，整条链路就是端到端加密的：中继只看到 `tag` + 密文，
+解不开 prompt，也看不出这个 tag 对应哪个会话。
+
+```mermaid
+flowchart LR
+    A["sbp-agents 启动<br/>随机密钥 → .env"] --> B[".copy4client<br/>sbp1.…（每台客户端一行）"]
+    A --> C[".copy4relay<br/>SBP_TRUSTED_KEYS=…（只有公钥）"]
+    B -. "粘贴" .-> D["控制台 / 小程序"]
+    C -. "只发公钥" .-> E["sbp-dispatcher"]
+    D == "wss /ws-e2ee · 信封" ==> E
+    E == "按 tag 投递 · 不解密" ==> F["sbp-agents"]
+```
+
+## 加一台服务器（手工填）
 
 点左上角 ⚙ → ＋新增：
 
@@ -37,6 +61,9 @@ open index.html
 | keyId + secret | 服务端 `SBP_HMAC_KEYS` 里配的那对 |
 
 「测试连接」会真的握手并拉一次会话列表，返回「设备 N 台 · 会话 M 个」才算通。
+
+勾上 **E2EE（端到端加密）** 后地址会改写为 `/ws-e2ee`，需要填：设备 DID、路由密钥 rk、
+对端 keyId / box 公钥 / sign 公钥、本机 keyId。本机私钥存 localStorage，永不上传。
 
 配置存在浏览器 localStorage 里。点「复制配置链接」会生成一条带 `?cfg=` 的链接，
 在手机/另一台电脑打开即可导入同一份配置（**链接里含密钥，别乱发**）。
