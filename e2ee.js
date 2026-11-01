@@ -222,8 +222,8 @@
     try { return sodium.crypto_sign_verify_detached(b64u_decode(sig_b64), signed, sign_pk) } catch (e) { return false }
   }
 
-  // -------------------------------------------------- 连接串（.copy4client）
-  // sbp-agent 生成的 .copy4client 里每台客户端一行：sbp1.<base64url(json)>。
+  // -------------------------------------------------- 连接串（.copy2client）
+  // sbp-agent 生成的 .copy2client 里每台客户端一行：sbp1.<base64url(json)>。
   // 整段粘贴进控制台/小程序即可导入，所以这里就把解析放在加密内核里，
   // 控制台（console.js）与小程序共用同一份实现。
   var CONNECT_PREFIX = 'sbp1.'
@@ -247,7 +247,7 @@
       box_pk: p.box_pk || '', sign_pk: p.sign_pk || ''
     }
   }
-  /** 解析粘贴内容：.copy4client 整段 / ?cfg= 分享链接 / JSON 数组，都吃。 */
+  /** 解析粘贴内容：.copy2client 整段 / ?cfg= 分享链接 / JSON 数组，都吃。 */
   function parseConnectText(text) {
     var out = []
     String(text || '').split(/\r?\n/).forEach(function (line) {

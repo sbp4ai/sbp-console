@@ -175,7 +175,7 @@ code{background:#f1f3f7;border-radius:4px;padding:1px 4px;font-size:11.5px}
 #fMyKeys code{display:inline-block;max-width:100%;word-break:break-all;background:#f1f5f9;
   padding:1px 5px;border-radius:5px;font-size:11.5px}
 
-/* ---------------------------------------------------- 粘贴导入（.copy4client） */
+/* ---------------------------------------------------- 粘贴导入（.copy2client） */
 .paste-box{margin:10px 0 4px;padding:10px 12px;border:1px dashed #cbd5e1;border-radius:12px;
   background:#f8fafc}
 .paste-box .paste-head{display:flex;align-items:baseline;gap:8px;margin-bottom:6px}

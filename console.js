@@ -347,7 +347,7 @@
       history.replaceState(null, '', location.pathname + (location.hash || ''))
     },
 
-    /** 粘贴导入：.copy4client 整段（可含两台客户端）→ 服务器列表 + 私钥播种。 */
+    /** 粘贴导入：.copy2client 整段（可含两台客户端）→ 服务器列表 + 私钥播种。 */
     importPaste: function (text) {
       if (text === undefined || text === null) text = $('mgrPaste').value
       var msg = $('mgrImportMsg')

@@ -27,26 +27,30 @@ open index.html
 
 ## 最省事的一条路：粘贴导入（E2EE）
 
-机器上装了 [`sbp-agents`](https://pypi.org/project/sbp-agents/) 的话，启动后它会把连接信息
-写到 `.copy4client` 并在终端打印出来：
+机器上装了 [`sbp4ai-agents`](https://pypi.org/project/sbp4ai-agents/) 的话，启动后它会把连接信息
+写到 `.copy2client`，并在横幅里打印它的**绝对路径**：
 
 ```bash
-cat .copy4client        # 整段复制
+pip install sbp4ai-agents
+sbp-agents --relay wss://relay.example.com/ws-e2ee
+cat .copy2client        # 整段复制
 ```
 
-粘进控制台 ⚙ → **粘贴导入** 框 → 点「导入」，一次导入两台客户端（网页控制台 + 微信小程序），
-每台自带私钥 —— DID / rk / 公钥都不用手填。中继那边用 `cat .copy4relay` 那行
-`SBP_TRUSTED_KEYS=` 启动，整条链路就是端到端加密的：中继只看到 `tag` + 密文，
-解不开 prompt，也看不出这个 tag 对应哪个会话。
+**标准用法：`cat .copy2client` → 整段复制 → 粘进控制台/小程序的「粘贴导入」框，
+一次导入两台客户端（`cli-web` 网页控制台 + `cli-minis` 微信小程序）。**
+
+粘进控制台 ⚙ → **粘贴导入** 框 → 点「导入」，每台自带私钥 —— DID / rk / 公钥都不用手填。
+中继那边用 `cat .copy4relay` 那行 `SBP_TRUSTED_KEYS=` 启动，整条链路就是端到端加密的：
+中继只看到 `tag` + 密文，解不开 prompt，也看不出这个 tag 对应哪个会话。
 
 ```mermaid
 flowchart LR
-    A["sbp-agents 启动<br/>随机密钥 → .env"] --> B[".copy4client<br/>sbp1.…（每台客户端一行）"]
+    A["sbp4ai-agents 启动<br/>随机密钥 → .env"] --> B[".copy2client<br/>sbp1.…（每台客户端一行）"]
     A --> C[".copy4relay<br/>SBP_TRUSTED_KEYS=…（只有公钥）"]
     B -. "粘贴" .-> D["控制台 / 小程序"]
-    C -. "只发公钥" .-> E["sbp-dispatcher"]
+    C -. "只发公钥" .-> E["sbp4ai-dispatcher"]
     D == "wss /ws-e2ee · 信封" ==> E
-    E == "按 tag 投递 · 不解密" ==> F["sbp-agents"]
+    E == "按 tag 投递 · 不解密" ==> F["sbp4ai-agents"]
 ```
 
 ## 加一台服务器（手工填）
