@@ -3,25 +3,39 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
-<meta name="color-scheme" content="light">
+<meta name="color-scheme" content="light dark">
+<meta name="theme-color" content="#ffffff" media="(prefers-color-scheme: light)">
+<meta name="theme-color" content="#0b0f17" media="(prefers-color-scheme: dark)">
 <title>SBP4AI 控制台</title>
 <link rel="stylesheet" href="console.css">
 </head>
 <body>
 
 <div class="app">
-  <aside class="sidebar">
+  <aside class="sidebar" id="sidebar">
     <div class="sb-head">
-      <span class="brand">SBP4AI</span>
-      <button class="icon-btn" id="btnMgr" title="管理服务器">⚙</button>
-      <button class="icon-btn" id="btnRefresh" title="刷新会话">⟳</button>
+      <span class="logo">S</span>
+      <span class="brand"><b>SBP4AI</b><span>CONSOLE</span></span>
+      <span class="spacer"></span>
+      <button class="icon-btn" id="btnRefresh" title="刷新会话列表">⟳</button>
+      <button class="icon-btn" id="btnMgr" title="远端服务器">⚙</button>
     </div>
+
     <div class="sb-pick">
-      <select id="srvSel" title="切换远端服务器"></select>
+      <div class="pick-wrap">
+        <span class="ico">◈</span>
+        <select id="srvSel" title="切换远端服务器"></select>
+        <span class="arrow">▾</span>
+      </div>
     </div>
+
     <div class="sb-state">
       <span class="dot off" id="dot"></span><span id="connState">未连接</span>
+      <span class="spacer"></span>
+      <span id="sbCount"></span>
     </div>
+
+    <!-- 只有「此刻还在跑的 agent 会话」在这里；历史会话不上侧栏 -->
     <div class="sb-body" id="list"></div>
   </aside>
 
@@ -30,37 +44,48 @@
       <button class="icon-btn sb-toggle" id="btnMenu" title="会话列表">☰</button>
       <div class="ttl">
         <div class="t1" id="sessTitle">未选择会话</div>
-        <div class="t2"><span id="sessSid"></span> <span class="chip" id="sessState"></span></div>
+        <div class="t2">
+          <span class="chip" id="sessState" hidden></span>
+          <span class="sid" id="sessSid"></span>
+        </div>
       </div>
       <span class="spacer"></span>
-      <button class="icon-btn" id="btnSnap" title="抓一屏">⟳</button>
-      <button class="icon-btn" id="btnEsc" title="发送 Esc">Esc</button>
+      <button class="act-btn" id="btnSnap" title="重新抓一屏">抓屏</button>
+      <button class="act-btn" id="btnEsc" title="发送 Esc">Esc</button>
     </header>
 
     <div class="empty" id="empty">
-      <div class="big">⌨</div>
-      <div>从左侧选一个会话</div>
-      <div class="hint">左上角下拉切换服务器</div>
+      <div class="big">⌘</div>
+      <div class="t">选一个正在运行的 agent 会话</div>
+      <div class="hint">左侧只列出活跃会话；没有 agent 的机器点进去是空终端，敲 claude 即可唤醒</div>
     </div>
 
-    <div class="stream" id="stream" hidden>
-      <div class="stream-head" id="streamHead">
-        <span class="caret">▾</span><span>会话历史</span>
+    <section class="stage" id="stage" hidden>
+      <!-- 会话历史：默认展开，点标题折叠 -->
+      <div class="stream" id="stream">
+        <div class="pane-head" id="streamHead">
+          <span class="caret">▾</span><span class="ph-t">会话历史</span>
+          <span class="ph-c" id="msgCount"></span>
+        </div>
+        <div id="msgs"></div>
       </div>
-      <div id="msgs"></div>
-    </div>
 
-    <div class="screen-wrap" id="screenWrap" hidden>
-      <div class="screen-head" id="screenHead">
-        <span class="caret">▾</span><span>实时屏幕</span>
+      <!-- 实时屏幕：折叠时只剩一条标题 -->
+      <div class="screen-wrap" id="screenWrap">
+        <div class="pane-head" id="screenHead">
+          <span class="caret">▾</span><span class="ph-t">实时屏幕</span>
+          <span class="spacer"></span>
+          <span class="st" id="screenState" hidden></span>
+        </div>
+        <pre id="screen"></pre>
       </div>
-      <pre id="screen"></pre>
-    </div>
+    </section>
 
     <!-- SBP-0.2：agent 摆在终端上的选项，这里变成可点的按钮 -->
     <div class="prompts" id="prompts" hidden></div>
 
     <div class="composer" id="composerWrap" hidden>
+      <div class="quick" id="quick" hidden></div>
       <div class="composer-row">
         <textarea class="input" id="input" rows="1" placeholder="输入指令，Enter 发送，Shift+Enter 换行"></textarea>
         <button class="send" id="send">发送</button>
@@ -125,8 +150,8 @@
         <div class="frow"><label>对端 sign 公钥</label><input id="fPeerSignPk" autocomplete="off" spellcheck="false"></div>
         <div class="frow"><label>我的密钥</label>
           <button class="mini" id="fGenKeys" type="button">生成 / 显示我的公钥</button>
-          <span class="hint" id="fMyKeys"></span>
         </div>
+        <div class="frow"><label></label><span class="hint" id="fMyKeys"></span></div>
       </div>
 
       <div class="frow"><label></label>
